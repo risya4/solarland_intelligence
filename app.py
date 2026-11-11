@@ -16,7 +16,7 @@ from streamlit_folium import st_folium
 
 # =========================================================
 # SOLARLAND INTELLIGENCE
-# Candidate Technical Assessment - Perkasa Land Development
+# Perkasa Land Development
 # =========================================================
 
 st.set_page_config(
@@ -173,7 +173,7 @@ def road_distance_km(origin, destination):
         response = requests.get(
             url,
             params={"overview": "false", "alternatives": "false", "steps": "false"},
-            headers={"User-Agent": "SolarLandIntelligenceAssessment/1.0"},
+            headers={"User-Agent": "SolarLandIntelligence/1.0"},
             timeout=18,
         )
         response.raise_for_status()
@@ -303,7 +303,7 @@ def load_geojson(upload):
 st.markdown(
     """
     <div class="hero">
-      <div class="eyebrow">Perkasa Land Development · Technical Assessment Prototype</div>
+      <div class="eyebrow">Perkasa Land Development</div>
       <h1>☀️ SolarLand Intelligence</h1>
       <p>Land suitability screening for potential solar farm development</p>
     </div>
@@ -319,10 +319,10 @@ st.info(
 
 # ------------------------- Sidebar controls -------------------------
 st.sidebar.markdown("## ☀️ SolarLand")
-st.sidebar.caption("Assessment workspace")
+st.sidebar.caption("Land Intelligence Workspace")
 page = st.sidebar.radio(
     "Navigation",
-    ["Overview", "PMU & Criteria", "Land Explorer", "Assessment Results", "Export Report"],
+    ["Overview", "PMU Configuration", "Land Explorer", "Land Evaluation", "Export Evaluation Results"],
 )
 st.sidebar.divider()
 st.sidebar.markdown("### PMU location")
@@ -433,7 +433,7 @@ if not land_df.empty and min_acres <= max_acres:
 # ------------------------- Page: Overview -------------------------
 if page == "Overview":
     st.markdown('<div class="section-kicker">Overview</div>', unsafe_allow_html=True)
-    st.subheader("Assessment dashboard")
+    st.subheader("Land Intelligence Overview")
     if land_df.empty:
         st.warning("No parcel data loaded. Select demo data or upload a CSV / GeoJSON in the sidebar.")
     else:
@@ -478,11 +478,11 @@ if page == "Overview":
         if data_mode == "Illustrative demo data":
             st.warning("Demo dataset selected: parcel names, locations and areas are illustrative, not verified land records.")
 
-# ------------------------- Page: PMU & Criteria -------------------------
-elif page == "PMU & Criteria":
+# ------------------------- Page: PMU Configuration -------------------------
+elif page == "PMU Configuration":
     st.markdown('<div class="section-kicker">Configuration</div>', unsafe_allow_html=True)
-    st.subheader("PMU location and assessment criteria")
-    st.write("Change the PMU location and screening thresholds from the sidebar. The assessment updates when the app reruns.")
+    st.subheader("PMU Location & Evaluation Parameters")
+    st.write("Configure the PMU location and evaluation parameters using the sidebar. Results will automatically update based on the selected criteria.")
     st.markdown("#### Current PMU")
     st.write(f"**Name:** {pmu_name}")
     st.write(f"**State / District:** {selected_state} / {selected_district or 'Not specified'}")
@@ -551,10 +551,10 @@ elif page == "Land Explorer":
         st_folium(fmap, use_container_width=True, height=590, returned_objects=[])
         st.caption("Map tiles and location services require an internet connection. The circles show straight-line radius zones, not road-network buffers.")
 
-# ------------------------- Page: Assessment Results -------------------------
-elif page == "Assessment Results":
+# ------------------------- Page: Land Evaluation -------------------------
+elif page == "Land Evaluation":
     st.markdown('<div class="section-kicker">Screening output</div>', unsafe_allow_html=True)
-    st.subheader("Ranked land assessment")
+    st.subheader("Ranked Land Evaluation")
     if land_df.empty:
         st.warning("Load parcel data using the sidebar.")
     else:
@@ -576,14 +576,14 @@ elif page == "Assessment Results":
         )
         st.caption("This is a simplified initial-screening rule. Parcels without a returned road route or confirmed area remain Pending Verification. Terrain, land title, zoning, flood risk, access rights, grid capacity, environmental constraints and site inspections are not assessed.")
 
-# ------------------------- Page: Export Report -------------------------
-elif page == "Export Report":
+# ------------------------- Page: Export Evaluation Results -------------------------
+elif page == "Export Evaluation Results":
     st.markdown('<div class="section-kicker">Reporting</div>', unsafe_allow_html=True)
-    st.subheader("Export assessment results")
+    st.subheader("Export Evaluation Results")
     if land_df.empty:
         st.warning("No results available to export. Load parcel data first.")
     else:
-        st.write("Download the current assessment as an Excel workbook or CSV file.")
+        st.write("Download the current results as an Excel workbook or CSV file.")
         report = land_df.copy()
         report["PMU Name"] = pmu_name
         report["PMU Latitude"] = pmu_lat
@@ -594,7 +594,7 @@ elif page == "Export Report":
         report["Maximum Distance (km)"] = max_km
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            report.to_excel(writer, index=False, sheet_name="Land Assessment")
+            report.to_excel(writer, index=False, sheet_name="Land Evaluation")
             criteria = pd.DataFrame({
                 "Parameter": ["PMU Name", "PMU Latitude", "PMU Longitude", "Minimum Acres",
                               "Maximum Acres", "Preferred Distance km", "Maximum Distance km",
@@ -605,16 +605,16 @@ elif page == "Export Report":
             })
             criteria.to_excel(writer, index=False, sheet_name="Criteria & Notes")
         st.download_button(
-            "⬇ Download Excel assessment",
+            "⬇ Download Evaluation Workbook",
             data=buffer.getvalue(),
-            file_name="SolarLand_Intelligence_Assessment.xlsx",
+            file_name="SolarLand_Intelligence.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
         )
         st.download_button(
             "⬇ Download CSV results",
             data=report.to_csv(index=False).encode("utf-8-sig"),
-            file_name="SolarLand_Intelligence_Assessment.csv",
+            file_name="SolarLand_Intelligence.csv",
             mime="text/csv",
         )
         st.caption("The workbook includes the parcel results and a separate sheet recording the PMU and screening criteria.")
@@ -622,7 +622,7 @@ elif page == "Export Report":
 # ------------------------- Footer -------------------------
 st.divider()
 st.caption(
-    "SolarLand Intelligence · Assessment prototype · "
+    "SolarLand Intelligence"
     "Public data/services are subject to availability and their own terms. "
     "No confidential or restricted data should be uploaded."
 )
