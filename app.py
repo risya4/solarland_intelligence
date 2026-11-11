@@ -86,24 +86,82 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2 * r * math.asin(math.sqrt(a))
 
 
+class GeocodingUnavailableError(RuntimeError):
+    """Raised when all configured place-search services are unavailable."""
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
 def geocode_place(query: str) -> Optional[Tuple[float, float, str]]:
-    """Resolve a place name using OpenStreetMap Nominatim."""
-    url = "https://nominatim.openstreetmap.org/search"
-    headers = {"User-Agent": "SolarLandIntelligenceAssessment/1.0 (educational prototype)"}
-    response = requests.get(
-        url,
-        params={"q": query, "format": "jsonv2", "limit": 1},
-        headers=headers,
-        timeout=20,
-    )
-    response.raise_for_status()
-    results = response.json()
-    if not results:
+    """
+    Resolve a place name using Nominatim, then Photon as a fallback.
+    Results are cached for 24 hours to reduce repeated public API requests.
+    """
+    query = (query or "").strip()
+    if not query:
         return None
-    item = results[0]
-    return float(item["lat"]), float(item["lon"]), item.get("display_name", query)
+
+    headers = {
+        "User-Agent": "SolarLandIntelligence/1.0 (land suitability screening prototype)",
+        "Accept": "application/json",
+        "Accept-Language": "en",
+    }
+    errors = []
+
+    # Primary provider: OpenStreetMap Nominatim.
+    try:
+        response = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": query, "format": "jsonv2", "limit": 1, "addressdetails": 1},
+            headers=headers,
+            timeout=(5, 12),
+        )
+        response.raise_for_status()
+        results = response.json()
+        if results:
+            item = results[0]
+            return (
+                float(item["lat"]),
+                float(item["lon"]),
+                item.get("display_name", query),
+            )
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        errors.append(f"Nominatim: {type(exc).__name__}")
+
+    # Fallback provider: Photon (Komoot), independent of Nominatim.
+    try:
+        response = requests.get(
+            "https://photon.komoot.io/api/",
+            params={"q": query, "limit": 1, "lang": "en"},
+            headers=headers,
+            timeout=(5, 12),
+        )
+        response.raise_for_status()
+        features = response.json().get("features", [])
+        if features:
+            feature = features[0]
+            coordinates = feature.get("geometry", {}).get("coordinates", [])
+            if len(coordinates) >= 2:
+                props = feature.get("properties", {})
+                label_parts = [
+                    props.get("name"),
+                    props.get("city") or props.get("district"),
+                    props.get("state"),
+                    props.get("country"),
+                ]
+                label = ", ".join(dict.fromkeys(x for x in label_parts if x)) or query
+                return float(coordinates[1]), float(coordinates[0]), label
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        errors.append(f"Photon: {type(exc).__name__}")
+
+    if errors:
+        raise GeocodingUnavailableError(
+            "Location search services could not be reached. Please try again later "
+            "or enter the PMU latitude and longitude manually."
+        )
+    return None
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def road_distance_km(origin, destination):
     """Try OSRM public demo routing service. Returns None when unavailable."""
     # OSRM coordinates are longitude,latitude
@@ -145,10 +203,13 @@ def polygon_center(geometry):
 
 
 def classify_land(acres, distance_km, min_acres, max_acres, preferred_km, max_km):
-    size_ok = pd.notna(acres) and min_acres <= float(acres) <= max_acres
-    if size_ok and pd.notna(distance_km) and float(distance_km) <= preferred_km:
+    # Do not substitute straight-line distance for a road-distance decision.
+    if pd.isna(acres) or pd.isna(distance_km):
+        return "Pending Verification"
+    size_ok = min_acres <= float(acres) <= max_acres
+    if size_ok and float(distance_km) <= preferred_km:
         return "Good Fit"
-    if size_ok and pd.notna(distance_km) and float(distance_km) <= max_km:
+    if size_ok and float(distance_km) <= max_km:
         return "Worth a Look"
     return "No Good"
 
@@ -161,6 +222,9 @@ def sample_data():
         "Latitude": [6.4550, 6.4750, 6.4900, 6.4400, 6.5100, 6.4620],
         "Longitude": [100.4250, 100.4350, 100.4500, 100.4100, 100.4600, 100.4050],
         "Land Size (Acres)": [90, 85, 120, 75, 95, 82],
+        "State": ["Kedah"] * 6,
+        "District": ["Kubang Pasu"] * 6,
+        "Verification Status": ["Illustrative - Not Verified"] * 6,
         "Data Source": ["Illustrative sample"] * 6,
     })
 
@@ -192,7 +256,14 @@ def normalize_csv(df):
         df["Land Size (Acres)"] = pd.NA
     for c in ["Latitude", "Longitude", "Land Size (Acres)"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["Data Source"] = "User-uploaded CSV"
+    if "State" not in df.columns:
+        df["State"] = "Not specified"
+    if "District" not in df.columns:
+        df["District"] = "Not specified"
+    if "Verification Status" not in df.columns:
+        df["Verification Status"] = "Unverified - User supplied"
+    if "Data Source" not in df.columns:
+        df["Data Source"] = "User-uploaded CSV"
     df = df.dropna(subset=["Latitude", "Longitude"])
     df = df[df["Latitude"].between(-90, 90) & df["Longitude"].between(-180, 180)]
     return df.reset_index(drop=True)
@@ -218,7 +289,10 @@ def load_geojson(upload):
             "Latitude": lat,
             "Longitude": lon,
             "Land Size (Acres)": acres,
-            "Data Source": "Uploaded GeoJSON polygon",
+            "State": str(props.get("state", "Not specified")),
+            "District": str(props.get("district", "Not specified")),
+            "Verification Status": str(props.get("verification_status", "Unverified - User supplied")),
+            "Data Source": str(props.get("data_source", "Uploaded GeoJSON polygon")),
         })
     if not rows:
         raise ValueError("GeoJSON tidak mengandungi polygon yang sah.")
@@ -229,7 +303,7 @@ def load_geojson(upload):
 st.markdown(
     """
     <div class="hero">
-      <div class="eyebrow">Perkasa Land Development</div>
+      <div class="eyebrow">Perkasa Land Development · Technical Assessment Prototype</div>
       <h1>☀️ SolarLand Intelligence</h1>
       <p>Land suitability screening for potential solar farm development</p>
     </div>
@@ -245,13 +319,21 @@ st.info(
 
 # ------------------------- Sidebar controls -------------------------
 st.sidebar.markdown("## ☀️ SolarLand")
-st.sidebar.caption("Land Intelligence Workspace")
+st.sidebar.caption("Assessment workspace")
 page = st.sidebar.radio(
     "Navigation",
-    ["Overview", "PMU Configuration", "Land Explorer", "Land Evaluation", "Export Report"],
+    ["Overview", "PMU & Criteria", "Land Explorer", "Assessment Results", "Export Report"],
 )
 st.sidebar.divider()
 st.sidebar.markdown("### PMU location")
+MALAYSIA_STATES = [
+    "Johor", "Kedah", "Kelantan", "Melaka", "Negeri Sembilan",
+    "Pahang", "Perak", "Perlis", "Pulau Pinang", "Sabah",
+    "Sarawak", "Selangor", "Terengganu", "W.P. Kuala Lumpur",
+    "W.P. Labuan", "W.P. Putrajaya"
+]
+selected_state = st.sidebar.selectbox("State / Federal Territory", MALAYSIA_STATES, index=1)
+selected_district = st.sidebar.text_input("District / area (optional)", "Kubang Pasu")
 pmu_name = st.sidebar.text_input("PMU / target location name", "PMU Bukit Kayu Hitam")
 coord_mode = st.sidebar.radio("Location input", ["Enter coordinates", "Search place name"])
 if coord_mode == "Enter coordinates":
@@ -259,7 +341,7 @@ if coord_mode == "Enter coordinates":
     pmu_lon = st.sidebar.number_input("Longitude", value=100.4200, format="%.6f")
     resolved_label = "Coordinates entered by user"
 else:
-    place_query = st.sidebar.text_input("Search location", "PMU Bukit Kayu Hitam, Kedah, Malaysia")
+    place_query = st.sidebar.text_input("Search location", f"{pmu_name}, {selected_district}, {selected_state}, Malaysia")
     if st.sidebar.button("Find location", type="primary", use_container_width=True):
         try:
             found = geocode_place(place_query)
@@ -268,8 +350,13 @@ else:
                 st.sidebar.success("Location found.")
             else:
                 st.sidebar.warning("No matching place found. Try a more specific name.")
-        except requests.RequestException:
-            st.sidebar.error("Geocoding service is unavailable. Enter coordinates instead.")
+        except GeocodingUnavailableError as exc:
+            st.sidebar.error(str(exc))
+        except Exception:
+            st.sidebar.error(
+                "Location search could not be completed. Please try a more specific "
+                "place name or enter coordinates manually."
+            )
     stored = st.session_state.get("pmu_geocode", (6.4500, 100.4200, "Default example coordinates"))
     pmu_lat, pmu_lon, resolved_label = stored
     st.sidebar.caption(f"Resolved: {resolved_label[:90]}")
@@ -322,13 +409,12 @@ if not land_df.empty and min_acres <= max_acres:
         road = road_distance_km((pmu_lat, pmu_lon), (row["Latitude"], row["Longitude"])) if use_osrm else None
         if road is not None:
             road_values.append(road)
-            distance_types.append("OSRM road route")
+            distance_types.append("OSRM driving route")
         else:
-            road_values.append(row["Straight-line Distance (km)"])
-            distance_types.append("Straight-line estimate (fallback)")
-        # Be polite to public demo routing service.
+            road_values.append(pd.NA)
+            distance_types.append("Unavailable - route not returned")
         if use_osrm:
-            time.sleep(0.12)
+            time.sleep(0.20)
     land_df["Road Distance / Estimate (km)"] = road_values
     land_df["Distance Method"] = distance_types
     land_df["Classification"] = land_df.apply(
@@ -338,7 +424,7 @@ if not land_df.empty and min_acres <= max_acres:
         ), axis=1
     )
     land_df["Distance (km)"] = land_df["Road Distance / Estimate (km)"]
-    rank = {"Good Fit": 1, "Worth a Look": 2, "No Good": 3}
+    rank = {"Good Fit": 1, "Worth a Look": 2, "No Good": 3, "Pending Verification": 4}
     land_df["Rank"] = land_df["Classification"].map(rank)
     land_df = land_df.sort_values(
         ["Rank", "Distance (km)"], ascending=[True, True], na_position="last"
@@ -347,7 +433,7 @@ if not land_df.empty and min_acres <= max_acres:
 # ------------------------- Page: Overview -------------------------
 if page == "Overview":
     st.markdown('<div class="section-kicker">Overview</div>', unsafe_allow_html=True)
-    st.subheader("Land Intelligence Overview")
+    st.subheader("Assessment dashboard")
     if land_df.empty:
         st.warning("No parcel data loaded. Select demo data or upload a CSV / GeoJSON in the sidebar.")
     else:
@@ -355,12 +441,14 @@ if page == "Overview":
         good = int((land_df["Classification"] == "Good Fit").sum())
         look = int((land_df["Classification"] == "Worth a Look").sum())
         no_good = int((land_df["Classification"] == "No Good").sum())
+        pending = int((land_df["Classification"] == "Pending Verification").sum())
         known_acres = pd.to_numeric(land_df["Land Size (Acres)"], errors="coerce").sum()
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5m = st.columns(5)
         c1.metric("Parcels screened", total)
         c2.metric("Good Fit", good)
         c3.metric("Worth a Look", look)
         c4.metric("No Good", no_good)
+        c5m.metric("Pending verification", pending)
         c5, c6 = st.columns(2)
         c5.metric("Total listed area", f"{known_acres:,.2f} acres")
         c6.metric("PMU reference", pmu_name)
@@ -368,11 +456,11 @@ if page == "Overview":
         with left:
             st.markdown("#### Suitability distribution")
             counts = land_df["Classification"].value_counts().reindex(
-                ["Good Fit", "Worth a Look", "No Good"], fill_value=0
+                ["Good Fit", "Worth a Look", "No Good", "Pending Verification"], fill_value=0
             ).rename_axis("Classification").reset_index(name="Parcels")
             fig = px.bar(
                 counts, x="Classification", y="Parcels", color="Classification",
-                color_discrete_map={"Good Fit": GREEN, "Worth a Look": GOLD, "No Good": RED},
+                color_discrete_map={"Good Fit": GREEN, "Worth a Look": GOLD, "No Good": RED, "Pending Verification": "#7A8790"},
             )
             fig.update_layout(
                 showlegend=False, margin=dict(l=10, r=10, t=20, b=10),
@@ -391,12 +479,13 @@ if page == "Overview":
             st.warning("Demo dataset selected: parcel names, locations and areas are illustrative, not verified land records.")
 
 # ------------------------- Page: PMU & Criteria -------------------------
-elif page == "PMU Configuration":
+elif page == "PMU & Criteria":
     st.markdown('<div class="section-kicker">Configuration</div>', unsafe_allow_html=True)
-    st.subheader("PMU location and Evaluation Parameters")
+    st.subheader("PMU location and assessment criteria")
     st.write("Change the PMU location and screening thresholds from the sidebar. The assessment updates when the app reruns.")
     st.markdown("#### Current PMU")
     st.write(f"**Name:** {pmu_name}")
+    st.write(f"**State / District:** {selected_state} / {selected_district or 'Not specified'}")
     st.write(f"**Latitude:** {pmu_lat:.6f}  ·  **Longitude:** {pmu_lon:.6f}")
     st.write(f"**Location source:** {resolved_label}")
     st.markdown("#### Screening thresholds")
@@ -429,14 +518,25 @@ elif page == "Land Explorer":
             color=GOLD, fill=True, fill_opacity=0.04,
             tooltip=f"Maximum zone: {max_km:g} km",
         ).add_to(fmap)
-        marker_colors = {"Good Fit": "green", "Worth a Look": "orange", "No Good": "red"}
+        marker_colors = {"Good Fit": "green", "Worth a Look": "orange", "No Good": "red", "Pending Verification": "gray"}
         for _, row in land_df.iterrows():
+            road_distance = row["Distance (km)"]
+            distance_label = (
+                f"{float(road_distance):.2f} km"
+                if pd.notna(road_distance) else "Unavailable"
+            )
+            area_value = row["Land Size (Acres)"]
+            area_label = (
+                f"{float(area_value):.2f} acres"
+                if pd.notna(area_value) else "Not provided"
+            )
             popup = (
                 f"<b>{row['Land Name']}</b><br>"
                 f"ID: {row['Land ID']}<br>"
-                f"Area: {row['Land Size (Acres)']} acres<br>"
-                f"Distance: {row['Distance (km)']:.2f} km<br>"
+                f"Area: {area_label}<br>"
+                f"Road distance: {distance_label}<br>"
                 f"Method: {row['Distance Method']}<br>"
+                f"Verification: {row.get('Verification Status', 'Unverified')}<br>"
                 f"Result: {row['Classification']}"
             )
             folium.Marker(
@@ -452,21 +552,21 @@ elif page == "Land Explorer":
         st.caption("Map tiles and location services require an internet connection. The circles show straight-line radius zones, not road-network buffers.")
 
 # ------------------------- Page: Assessment Results -------------------------
-elif page == "Land Evaluation":
+elif page == "Assessment Results":
     st.markdown('<div class="section-kicker">Screening output</div>', unsafe_allow_html=True)
-    st.subheader("Ranked Land Evaluation")
+    st.subheader("Ranked land assessment")
     if land_df.empty:
         st.warning("Load parcel data using the sidebar.")
     else:
-        st.caption("Classification is based on preferred area range and the available distance value. Road distance is used when OSRM returns a route; otherwise a straight-line estimate is clearly flagged.")
+        st.caption("Classification uses the preferred area range and a returned OSRM driving-route distance. If road routing is unavailable, the parcel remains Pending Verification; straight-line distance is shown separately only as a reference.")
         filter_status = st.multiselect(
             "Filter classification",
-            ["Good Fit", "Worth a Look", "No Good"],
-            default=["Good Fit", "Worth a Look", "No Good"],
+            ["Good Fit", "Worth a Look", "No Good", "Pending Verification"],
+            default=["Good Fit", "Worth a Look", "No Good", "Pending Verification"],
         )
         filtered = land_df[land_df["Classification"].isin(filter_status)]
-        cols = ["Rank", "Land ID", "Land Name", "Land Size (Acres)", "Straight-line Distance (km)",
-                "Road Distance / Estimate (km)", "Distance Method", "Classification", "Data Source"]
+        cols = ["Rank", "Land ID", "Land Name", "State", "District", "Land Size (Acres)", "Straight-line Distance (km)",
+                "Road Distance / Estimate (km)", "Distance Method", "Classification", "Verification Status", "Data Source"]
         st.dataframe(filtered[cols].round(2), use_container_width=True, hide_index=True)
         st.markdown("#### Classification logic")
         st.markdown(
@@ -474,12 +574,12 @@ elif page == "Land Evaluation":
             f"- **Worth a Look:** {min_acres:g}–{max_acres:g} acres and distance > {preferred_km:g} km but ≤ {max_km:g} km.\n"
             f"- **No Good:** outside the preferred size range or beyond {max_km:g} km, or missing area data."
         )
-        st.caption("This is a simplified initial-screening rule. Terrain, land title, zoning, flood risk, access rights, grid capacity, environmental constraints and site inspections are not assessed.")
+        st.caption("This is a simplified initial-screening rule. Parcels without a returned road route or confirmed area remain Pending Verification. Terrain, land title, zoning, flood risk, access rights, grid capacity, environmental constraints and site inspections are not assessed.")
 
 # ------------------------- Page: Export Report -------------------------
 elif page == "Export Report":
     st.markdown('<div class="section-kicker">Reporting</div>', unsafe_allow_html=True)
-    st.subheader("Export Evaluation Results")
+    st.subheader("Export assessment results")
     if land_df.empty:
         st.warning("No results available to export. Load parcel data first.")
     else:
@@ -505,7 +605,7 @@ elif page == "Export Report":
             })
             criteria.to_excel(writer, index=False, sheet_name="Criteria & Notes")
         st.download_button(
-            "⬇ Download Evaluation Workbook",
+            "⬇ Download Excel assessment",
             data=buffer.getvalue(),
             file_name="SolarLand_Intelligence_Assessment.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
